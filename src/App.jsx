@@ -4816,13 +4816,18 @@ const Admin = ({ trucks, queue, onUpdate, onDeleteTruck }) => {
     setMerging(true);
     try {
       // merge lane-by-lane: T-1 (target) มีสิทธิ์ก่อน ถ้า T-1 ไม่มีค่อยเอาของ T-2
-      const mergedQC   = { ...(src.qcLanes   || {}) };
-      const mergedLoad = { ...(src.loadLanes  || {}) };
+      // (เดิมลืม sampleLanes — ข้อมูลสุ่มตรวจของรถต้นทางเลยหายไปเงียบๆ ตอน merge ทั้งที่ยัง
+      // ไม่ได้ถูกคัดลอกไปไหน ทั้งที่ตัวรถต้นทางถูกลบทิ้ง (ตอนนี้ soft-delete แล้วก็จริง แต่ merge
+      // เองก็ควรพาข้อมูลไปครบตั้งแต่ต้น ไม่ใช่พึ่งการกู้คืนทีหลัง)
+      const mergedQC     = { ...(src.qcLanes     || {}) };
+      const mergedLoad   = { ...(src.loadLanes   || {}) };
+      const mergedSample = { ...(src.sampleLanes || {}) };
       for (const l of lanes) {
-        if (truck.qcLanes?.[l.id]?.done)   mergedQC[l.id]   = truck.qcLanes[l.id];
-        if (truck.loadLanes?.[l.id]?.done)  mergedLoad[l.id] = truck.loadLanes[l.id];
+        if (truck.qcLanes?.[l.id]?.done)     mergedQC[l.id]     = truck.qcLanes[l.id];
+        if (truck.loadLanes?.[l.id]?.done)   mergedLoad[l.id]   = truck.loadLanes[l.id];
+        if (truck.sampleLanes?.[l.id]?.done) mergedSample[l.id] = truck.sampleLanes[l.id];
       }
-      await onUpdate(selId, { qcLanes: mergedQC, loadLanes: mergedLoad });
+      await onUpdate(selId, { qcLanes: mergedQC, loadLanes: mergedLoad, sampleLanes: mergedSample });
       await onDeleteTruck(mergeId);
       setMergeId("");
       setMsg("✅ Merge สำเร็จ — ลบรถซ้ำแล้ว");
@@ -5671,11 +5676,11 @@ const MasterUpload = ({ masterLane, onMasterChange }) => {
 
 // ─── WORK TRACKING (Power BI–style matrix table) ─────────────────────────────
 const WT_GROUPS = [
-  { id: "info",  label: "",                       span: 2, dark: "#0f172a", mid: "#1e293b" },
-  { id: "entry", label: "เข้าโรงงาน / เบิกสินค้า", span: 4, dark: "#1d4ed8", mid: "#2563eb" },
-  { id: "parts", label: "🥩 ลานชิ้นส่วน",         span: 3, dark: "#c2410c", mid: "#ea580c" },
-  { id: "head",  label: "🐷 ลานหัว/เครื่องใน",     span: 3, dark: "#6d28d9", mid: "#7c3aed" },
-  { id: "pork",  label: "🐖 ลานหมูซีก",            span: 3, dark: "#9f1239", mid: "#be123c" },
+  { id: "info",  label: "ข้อมูลรถ/สินค้า",         span: 6, dark: "#0f172a", mid: "#1e293b" },
+  { id: "entry", label: "เข้าโรงงาน / เบิกสินค้า", span: 5, dark: "#1d4ed8", mid: "#2563eb" },
+  { id: "parts", label: "🥩 ลานชิ้นส่วน",         span: 15, dark: "#c2410c", mid: "#ea580c" },
+  { id: "head",  label: "🐷 ลานหัว/เครื่องใน",     span: 15, dark: "#6d28d9", mid: "#7c3aed" },
+  { id: "pork",  label: "🐖 ลานหมูซีก",            span: 15, dark: "#9f1239", mid: "#be123c" },
   { id: "docs",  label: "เอกสาร",                 span: 2, dark: "#0d9488", mid: "#0f766e" },
   { id: "exit",  label: "ออกโรงงาน",              span: 2, dark: "#475569", mid: "#64748b" },
 ];
@@ -5803,6 +5808,137 @@ const EntryStatTile = ({ icon, accent, title, count, prevCount, onTimePct, onTim
   </div>
 );
 
+// ── สถานะของ log ปิดวันทำงาน (wh_archive_audit.status) → สี/ป้ายที่แสดงในหน้า Tracking ──
+const WORK_LOG_STATUS_STYLE = {
+  SUCCESS:  { bg: "#dcfce7", fg: "#166534", label: "SUCCESS" },
+  WARNING:  { bg: "#fef3c7", fg: "#92400e", label: "WARNING" },
+  ERROR:    { bg: "#fee2e2", fg: "#991b1b", label: "ERROR" },
+  PARTIAL:  { bg: "#dbeafe", fg: "#1e40af", label: "PARTIAL" },
+  NO_DATA:  { bg: "#f3f4f6", fg: "#6b7280", label: "NO DATA" },
+};
+const WorkLogStatusBadge = ({ status }) => {
+  const s = WORK_LOG_STATUS_STYLE[status] || { bg: "#f3f4f6", fg: "#6b7280", label: status || "ไม่มี log" };
+  return <span style={{ background: s.bg, color: s.fg, fontWeight: 800, fontSize: 11, padding: "3px 8px", borderRadius: 0, whiteSpace: "nowrap" }}>{s.label}</span>;
+};
+
+// ── ตารางสุขภาพข้อมูลรายวัน (โหมดช่วงวันที่ / ทั้งหมด ในหน้า Tracking) ──
+// อ่านจาก view wh_daily_health (ดู supabase-add-work-log-and-health-check.sql) — เทียบจำนวนที่
+// archive ไว้จริงกับ log การปิดวันทำงานล่าสุดของวันนั้น ใช้ตอบคำถาม "วันไหนข้อมูลผิดปกติ/หายไป"
+const DailyHealthTable = ({ rows, loading, onViewDate }) => {
+  const th = { padding: "9px 12px", textAlign: "left", fontWeight: 700, color: "#fff", background: "#1e293b", whiteSpace: "nowrap" };
+  const td = { padding: "9px 12px", borderBottom: "1px solid #f1f5f9", whiteSpace: "nowrap" };
+  return (
+    <div style={{ background: "#fff", boxShadow: "0 4px 16px rgba(0,0,0,0.1)", marginBottom: 16, overflowX: "auto" }}>
+      <div style={{ padding: "12px 16px", fontWeight: 800, fontSize: 14, borderBottom: "1px solid #f1f5f9" }}>
+        🩺 สุขภาพข้อมูลรายวัน — ตรวจว่าวันไหนข้อมูลหาย/ผิดปกติจากประวัติการปิดวันทำงานจริง
+      </div>
+      {loading && <div style={{ textAlign: "center", color: "#9ca3af", padding: 30 }}>กำลังโหลด...</div>}
+      {!loading && rows.length === 0 && <div style={{ textAlign: "center", color: "#9ca3af", padding: 30 }}>ไม่พบข้อมูล archive ในช่วงที่เลือก</div>}
+      {!loading && rows.length > 0 && (
+        <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 12.5, minWidth: 720 }}>
+          <thead><tr>
+            <th style={th}>วันที่</th><th style={th}>รถ</th><th style={th}>คิว</th>
+            <th style={th}>สถานะล่าสุด</th><th style={th}>ปิดวันโดย</th><th style={th}>เวลา</th>
+            <th style={th}>รายละเอียด</th><th style={th}>จำนวนครั้งที่ปิด</th><th style={th}></th>
+          </tr></thead>
+          <tbody>
+            {rows.map(r => {
+              const suspicious = r.trucks_count === 0 && r.queue_count === 0;
+              return (
+                <tr key={r.archive_date} style={{ background: suspicious ? "#fef2f2" : r.is_reconstructed ? "#fffbeb" : "#fff" }}>
+                  <td style={{ ...td, fontWeight: 700 }}>{r.archive_date}{r.is_reconstructed ? " 🛠️" : ""}</td>
+                  <td style={td}>{r.trucks_count}</td>
+                  <td style={td}>{r.queue_count}</td>
+                  <td style={td}><WorkLogStatusBadge status={r.last_status} /></td>
+                  <td style={td}>{r.last_source || "—"}</td>
+                  <td style={td}>{r.last_run_at ? new Date(r.last_run_at).toLocaleString("th-TH") : "—"}</td>
+                  <td style={{ ...td, maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", color: "#991b1b" }} title={r.last_detail || ""}>{r.last_detail || "—"}</td>
+                  <td style={td}>{r.run_count}{r.run_count > 1 ? " ⚠️ ปิดซ้ำ" : ""}</td>
+                  <td style={td}>
+                    <button onClick={() => onViewDate(r.archive_date)}
+                      style={{ background: "#111827", color: "#fff", border: "none", padding: "4px 10px", fontSize: 11.5, fontWeight: 700, cursor: "pointer" }}>
+                      ดูรายวัน
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+};
+
+// ── Data Health Check ของวันเดียว: Input/Processed/Output/Missing/Error/Status ──
+// (ตามข้อ 8 ที่ขอ) + log การปิดวันทำงานดิบของวันนั้นแบบขยายดูได้ ตอบคำถาม "ข้อมูลหายไปตรงไหน เมื่อไหร่"
+const DataHealthPanel = ({ date, today, activeTrucks, activeQueue, audit }) => {
+  const [expanded, setExpanded] = useState(false);
+  if (date === today) {
+    return (
+      <div style={{ background: "#eff6ff", color: "#1e3a8a", padding: "8px 14px", fontSize: 12.5, fontWeight: 700, marginBottom: 12 }}>
+        🩺 วันนี้ยังไม่ปิดวันทำงาน (ข้อมูลจะถูกตรวจสุขภาพหลังปิดวันแล้ว) — ตอนนี้มีรถ {activeTrucks.length} คัน, คิว {activeQueue.length} รายการ
+      </div>
+    );
+  }
+  const latest = audit[0]; // audit เรียง ts desc มาแล้ว
+  const inputCount  = latest ? latest.trucks_before + latest.queue_before : null;
+  const outputCount = activeTrucks.length + activeQueue.length;
+  const plateCounts = {};
+  for (const t of activeTrucks) { if (t.plate) plateCounts[t.plate] = (plateCounts[t.plate] || 0) + 1; }
+  const duplicateCount = Object.values(plateCounts).filter(c => c > 1).length;
+  const errorRuns = audit.filter(a => a.action === "error" || a.status === "ERROR").length;
+  const warningRuns = audit.filter(a => a.status === "WARNING").length;
+  const status = errorRuns > 0 ? "ERROR" : warningRuns > 0 ? "WARNING" : outputCount === 0 ? "NO_DATA" : (latest?.status || (audit.length ? latest?.status : null));
+  const missing = inputCount != null ? Math.max(0, inputCount - outputCount) : null;
+
+  const cell = { padding: "10px 14px", textAlign: "center", borderRight: "1px solid #f1f5f9" };
+  return (
+    <div style={{ background: "#fff", boxShadow: "0 2px 10px rgba(0,0,0,0.08)", marginBottom: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 14px", cursor: "pointer" }}
+        onClick={() => setExpanded(v => !v)}>
+        <span style={{ fontWeight: 800, fontSize: 14 }}>🩺 Data Health Check — {date}</span>
+        <span style={{ fontSize: 12, color: "#6b7280" }}>{expanded ? "▲ ซ่อน log" : "▼ ดู log การปิดวันทำงาน"}</span>
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", borderTop: "1px solid #f1f5f9" }}>
+        <div style={cell}><div style={{ fontSize: 11, color: "#9ca3af" }}>Input</div><div style={{ fontWeight: 800 }}>{inputCount ?? "ไม่มี log"}</div></div>
+        <div style={cell}><div style={{ fontSize: 11, color: "#9ca3af" }}>Output (ที่แสดงจริง)</div><div style={{ fontWeight: 800 }}>{outputCount}</div></div>
+        <div style={cell}><div style={{ fontSize: 11, color: "#9ca3af" }}>Missing</div><div style={{ fontWeight: 800, color: missing > 0 ? "#dc2626" : "#111827" }}>{missing ?? "—"}</div></div>
+        <div style={cell}><div style={{ fontSize: 11, color: "#9ca3af" }}>Duplicate (ทะเบียนซ้ำ)</div><div style={{ fontWeight: 800, color: duplicateCount > 0 ? "#dc2626" : "#111827" }}>{duplicateCount}</div></div>
+        <div style={cell}><div style={{ fontSize: 11, color: "#9ca3af" }}>Error runs</div><div style={{ fontWeight: 800, color: errorRuns > 0 ? "#dc2626" : "#111827" }}>{errorRuns}</div></div>
+        <div style={{ ...cell, borderRight: "none" }}><div style={{ fontSize: 11, color: "#9ca3af" }}>สถานะ</div><div style={{ marginTop: 2 }}><WorkLogStatusBadge status={status} /></div></div>
+      </div>
+      {expanded && (
+        <div style={{ borderTop: "1px solid #f1f5f9", overflowX: "auto" }}>
+          {audit.length === 0
+            ? <div style={{ padding: 16, color: "#9ca3af", fontSize: 12.5 }}>ไม่มี log การปิดวันทำงานของวันนี้ (อาจเป็นข้อมูลเก่าก่อนติดตั้งระบบ audit log)</div>
+            : <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 12, minWidth: 640 }}>
+                <thead><tr style={{ background: "#f9fafb" }}>
+                  {["เวลา", "Source", "Action", "ก่อน (รถ/คิว)", "หลัง (รถ/คิว)", "สถานะ", "Ref ID", "รายละเอียด"].map(h => (
+                    <th key={h} style={{ padding: "8px 10px", textAlign: "left", fontWeight: 700, color: "#6b7280", borderBottom: "1px solid #e5e7eb", whiteSpace: "nowrap" }}>{h}</th>
+                  ))}
+                </tr></thead>
+                <tbody>
+                  {audit.map(a => (
+                    <tr key={a.id}>
+                      <td style={{ padding: "8px 10px", whiteSpace: "nowrap" }}>{new Date(a.ts).toLocaleString("th-TH")}</td>
+                      <td style={{ padding: "8px 10px" }}>{a.source}</td>
+                      <td style={{ padding: "8px 10px" }}>{a.action}</td>
+                      <td style={{ padding: "8px 10px" }}>{a.trucks_before} / {a.queue_before}</td>
+                      <td style={{ padding: "8px 10px" }}>{a.trucks_written ?? "—"} / {a.queue_written ?? "—"}</td>
+                      <td style={{ padding: "8px 10px" }}><WorkLogStatusBadge status={a.status} /></td>
+                      <td style={{ padding: "8px 10px", fontFamily: "monospace", fontSize: 11 }}>{a.ref_id || "—"}</td>
+                      <td style={{ padding: "8px 10px", maxWidth: 320 }}>{a.detail || "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>}
+        </div>
+      )}
+    </div>
+  );
+};
+
 const WorkTracking = ({ trucks, queue, detailMapByChannel = {}, masterLane = [] }) => {
   const today = cycleDateStr();
   const [date, setDate]       = useState(today);
@@ -5812,6 +5948,30 @@ const WorkTracking = ({ trucks, queue, detailMapByChannel = {}, masterLane = [] 
   const [histDetailMapByChannel, setHistDetailMapByChannel] = useState(null); // for a past date being viewed
   const [sortCol, setSortCol] = useState("arrivedAt");
   const [sortDir, setSortDir] = useState(1);
+
+  // โหมดดูข้อมูล — วันเดียว (ตารางละเอียด + สรุปสถิติ) หรือช่วงวันที่/ทั้งหมด (ตารางสุขภาพข้อมูลรายวัน)
+  const [dateMode, setDateMode] = useState("single"); // 'single' | 'range' | 'all'
+  const [rangeStart, setRangeStart] = useState(addDaysToDateStr(today, -6));
+  const [rangeEnd, setRangeEnd] = useState(today);
+  const [rangeHealth, setRangeHealth] = useState([]);
+  const [loadingRange, setLoadingRange] = useState(false);
+
+  // ── Data Health Check + audit log ของวันที่กำลังดู (โหมดวันเดียว) ──
+  const [dayAudit, setDayAudit] = useState([]);
+  useEffect(() => {
+    if (dateMode !== "single") return;
+    supabase.from("wh_archive_audit").select("*").eq("archive_date", date).order("ts", { ascending: false })
+      .then(({ data }) => setDayAudit(data || []));
+  }, [date, dateMode]);
+
+  // ── ตารางสุขภาพข้อมูลรายวัน (โหมดช่วงวันที่/ทั้งหมด) ──
+  useEffect(() => {
+    if (dateMode === "single") return;
+    setLoadingRange(true);
+    let q = supabase.from("wh_daily_health").select("*").order("archive_date", { ascending: false });
+    if (dateMode === "range") q = q.gte("archive_date", rangeStart).lte("archive_date", rangeEnd);
+    q.then(({ data }) => setRangeHealth(data || [])).finally(() => setLoadingRange(false));
+  }, [dateMode, rangeStart, rangeEnd]);
 
   // วันปัจจุบัน → ใช้ detailMap สด, วันย้อนหลัง → ดึงไฟล์ PO ของวันนั้นมาคำนวณใหม่
   // (Master ลานโหลดไม่ได้เก็บย้อนหลัง จึงใช้ตัวปัจจุบันร่วมกับไฟล์ PO ของวันที่ดู)
@@ -5827,7 +5987,12 @@ const WorkTracking = ({ trucks, queue, detailMapByChannel = {}, masterLane = [] 
   useEffect(() => {
     setArchiveData(null);
     setLoadingArchive(date !== today);
-    supabase.from("wh_archive").select("trucks, queue").eq("archive_date", date).single()
+    // is_reconstructed/reconstructed_note มาจาก supabase-add-archive-reconstructed-flag.sql —
+    // ถ้ายังไม่ได้รัน migration นั้น fallback ไป select แบบเดิมแทนเพื่อไม่ให้หน้า Tracking พังทั้งหน้า
+    supabase.from("wh_archive").select("trucks, queue, is_reconstructed, reconstructed_note").eq("archive_date", date).single()
+      .then(res => res.error
+        ? supabase.from("wh_archive").select("trucks, queue").eq("archive_date", date).single()
+        : res)
       .then(({ data }) => setArchiveData(data ?? null))
       .finally(() => setLoadingArchive(false));
   }, [date, today]);
@@ -5861,9 +6026,66 @@ const WorkTracking = ({ trucks, queue, detailMapByChannel = {}, masterLane = [] 
   const pNum = s => (String(s).match(/\d+/g) || []).pop() || "";
   const getQ = t => activeQueue.find(q => q.id === t.queueId) || activeQueue.find(q => pNum(q.plate) === pNum(t.plate) && pNum(q.plate) !== "");
 
+  // ── ตรวจสุขภาพข้อมูลของวันที่กำลังดู — เตือนแทนที่จะแสดงตารางว่างเงียบๆ ──
+  // (กันซ้ำกรณีแบบ archive วันที่ 6-8 ก.ย. 2026: แถวถูกเขียนทับด้วยคิวของ "วันถัดไป" หลัง
+  // race condition ใน promoteIfDue — ดู supabase-fix-archive-race-condition.sql)
+  const thaiDateToISO = s => {
+    const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(String(s || ""));
+    if (!m) return null;
+    return `${m[3]}-${String(m[2]).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}`;
+  };
+  const integrityWarning = (() => {
+    if (date === today) return null;
+    if (loadingArchive) return null;
+    if (!archiveData) return `ไม่พบข้อมูลของวันที่ ${date} ในระบบ archive เลย (อาจยังไม่ถึงเวลาปิดวันทำงาน หรือข้อมูลสูญหาย — ตรวจสอบ wh_archive_audit)`;
+    const mismatched = activeQueue.find(q => {
+      const iso = thaiDateToISO(q.date);
+      return iso && iso !== date;
+    });
+    if (mismatched) return `ข้อมูลคิวบางรายการมีวันที่ไม่ตรงกับ ${date} (พบ "${mismatched.date}") — แถว archive นี้อาจถูกเขียนทับผิดวันจากบั๊ก race condition เดิม ไม่ควรเชื่อถือข้อมูลชุดนี้`;
+    if (activeTrucks.length === 0 && activeQueue.length === 0) return `วันที่ ${date} มี archive แต่ไม่มีข้อมูลรถ/คิวเลย — ถ้าเป็นวันทำงานปกติ ให้ตรวจสอบว่าข้อมูลสูญหายหรือไม่`;
+    return null;
+  })();
+
+  // helper รวม note/รูปภาพ/bay/ตะกร้า/สถานะรอสินค้า ของแต่ละลาน ให้แสดงเป็น tooltip บนเซลล์เวลา
+  // แทนการเปิดคอลัมน์แยกรายฟิลด์ (จะทำให้ตารางกว้างเกินไป) — ข้อมูลยังดูได้ครบ แค่ hover เอา
+  // แต่ละลานสร้างคอลัมน์ชุดเดียวกัน 15 คอลัมน์ (QC 4 + สุ่มตรวจ 4 + โหลด 7) — ทำเป็นฟังก์ชันเดียว
+  // ใช้ซ้ำ 3 ลาน กันพิมพ์ผิด/ลืมอัพเดตไม่ตรงกันระหว่างลาน (เดิมเป็น tooltip เดียวรวมทุกอย่าง
+  // ย้ายมาเป็นคอลัมน์จริงให้เห็นครบโดยไม่ต้อง hover ตามที่ขอ)
+  const basketsSummary = load => {
+    if (!load?.baskets) return "—";
+    const s = Object.entries(load.baskets).filter(([, v]) => v).map(([k, v]) => `${k}=${v}`).join(", ");
+    return s || "—";
+  };
+  const waitingSummary = load => {
+    if (!load?.waiting) return "—";
+    return `รอตั้งแต่ ${load.waitingAt || "?"}${load.waitingFor ? ` (${load.waitingFor})` : ""}`;
+  };
+  const laneCols = (laneId, grp, laneLabel) => [
+    { id: `qc_${grp}`,          grp, label: "ตรวจอุณหภูมิรถ", align: "center", get: t => t.qcLanes?.[laneId]?.doneAt },
+    { id: `qc_${grp}_temp`,     grp, label: "อุณหภูมิ",        align: "center", type: "text", get: t => t.qcLanes?.[laneId]?.temp ? `${t.qcLanes[laneId].temp}°C` : "—" },
+    { id: `qc_${grp}_bay`,      grp, label: "ช่อง QC",         align: "center", type: "text", get: t => t.qcLanes?.[laneId]?.bayId || "—" },
+    { id: `qc_${grp}_photos`,   grp, label: "รูป QC",          align: "center", type: "text", get: t => t.qcLanes?.[laneId]?.photos?.length || "—" },
+    { id: `sample_${grp}`,        grp, label: "QC สุ่มตรวจ",     align: "center", get: t => t.sampleLanes?.[laneId]?.doneAt },
+    { id: `sample_${grp}_note`,   grp, label: "หมายเหตุสุ่มตรวจ", align: "left",   type: "text", get: t => t.sampleLanes?.[laneId]?.note || "—" },
+    { id: `sample_${grp}_bay`,    grp, label: "ช่องสุ่มตรวจ",    align: "center", type: "text", get: t => t.sampleLanes?.[laneId]?.bayId || "—" },
+    { id: `sample_${grp}_photos`, grp, label: "รูปสุ่มตรวจ",     align: "center", type: "text", get: t => t.sampleLanes?.[laneId]?.photos?.length || "—" },
+    { id: `load_${grp}`,          grp, label: "โหลดเสร็จ",       align: "center", get: t => t.loadLanes?.[laneId]?.doneAt },
+    { id: `load_${grp}_waiting`,  grp, label: "รอสินค้า",        align: "left",   type: "text", get: t => waitingSummary(t.loadLanes?.[laneId]) },
+    { id: `load_${grp}_bay`,      grp, label: "ช่องโหลด",        align: "center", type: "text", get: t => t.loadLanes?.[laneId]?.bayId || "—" },
+    { id: `load_${grp}_baskets`,  grp, label: "ตะกร้า/ตะขอ",     align: "left",   type: "text", get: t => basketsSummary(t.loadLanes?.[laneId]) },
+    { id: `load_${grp}_payer`,    grp, label: "ผู้จ่ายตะกร้า",   align: "left",   type: "text", get: t => t.loadLanes?.[laneId]?.basketPayer || "—" },
+    { id: `load_${grp}_note`,     grp, label: "หมายเหตุโหลด",    align: "left",   type: "text", get: t => t.loadLanes?.[laneId]?.note || "—" },
+    { id: `load_${grp}_photos`,   grp, label: "รูปโหลดเสร็จ",    align: "center", type: "text", get: t => t.loadLanes?.[laneId]?.photos?.length || "—" },
+  ];
+
   const COLS = [
     { id: "plate",            grp: "info",   label: "ทะเบียน",    align: "left",   get: t => t.plate },
-    { id: "customerGroup",    grp: "info",   label: "กลุ่มลูกค้า", align: "left",   get: t => t.customerGroup || "—" },
+    { id: "customerGroup",    grp: "info",   label: "กลุ่มลูกค้า", align: "left",   type: "text", get: t => t.customerGroup || "—" },
+    { id: "driver",           grp: "info",   label: "คนขับ",      align: "left",   type: "text", get: t => t.driver || getQ(t)?.driver || "—" },
+    { id: "product",          grp: "info",   label: "สินค้า",      align: "left",   type: "text", get: t => t.product || getQ(t)?.product || "—" },
+    { id: "destination",      grp: "info",   label: "ปลายทาง",    align: "left",   type: "text", get: t => t.destination || t.zone || getQ(t)?.destination || getQ(t)?.zone || "—" },
+    { id: "qty",              grp: "info",   label: "จำนวน",      align: "left",   type: "text", get: t => (t.qty || getQ(t)?.qty) ? `${t.qty ?? getQ(t)?.qty} ${t.unit || getQ(t)?.unit || ""}`.trim() : "—" },
     { id: "entrySTD",         grp: "entry",  label: "STD เข้า",   align: "center", get: t => getQ(t)?.entryTime },
     { id: "arrivedAt",        grp: "entry",  label: "ACT เข้า",   align: "center", get: t => t.arrivedAt },
     { id: "entryDelta",       grp: "entry",  label: "เข้าเร็ว/ช้า",   align: "center", get: t => {
@@ -5872,15 +6094,10 @@ const WorkTracking = ({ trucks, queue, detailMapByChannel = {}, masterLane = [] 
       return workTimeValue(t.arrivedAt) - workTimeValue(q.entryTime);
     } },
     { id: "pickingAt",        grp: "entry",  label: "พิมพ์ใบเบิก", align: "center", get: t => t.pickingAt },
-    { id: "qc_parts",     grp: "parts", label: "ตรวจอุณหภูมิรถ", align: "center", get: t => t.qcLanes?.lane_parts?.doneAt },
-    { id: "sample_parts", grp: "parts", label: "QC",              align: "center", get: t => t.sampleLanes?.lane_parts?.doneAt },
-    { id: "load_parts",   grp: "parts", label: "โหลดเสร็จ",      align: "center", get: t => t.loadLanes?.lane_parts?.doneAt },
-    { id: "qc_head",      grp: "head",  label: "ตรวจอุณหภูมิรถ", align: "center", get: t => t.qcLanes?.lane_head?.doneAt },
-    { id: "sample_head",  grp: "head",  label: "QC",              align: "center", get: t => t.sampleLanes?.lane_head?.doneAt },
-    { id: "load_head",    grp: "head",  label: "โหลดเสร็จ",      align: "center", get: t => t.loadLanes?.lane_head?.doneAt },
-    { id: "qc_pork",      grp: "pork",  label: "ตรวจอุณหภูมิรถ", align: "center", get: t => t.qcLanes?.lane_pork?.doneAt },
-    { id: "sample_pork",  grp: "pork",  label: "QC",              align: "center", get: t => t.sampleLanes?.lane_pork?.doneAt },
-    { id: "load_pork",    grp: "pork",  label: "โหลดเสร็จ",      align: "center", get: t => t.loadLanes?.lane_pork?.doneAt },
+    { id: "extraStatus",      grp: "entry",  label: "สถานะเพิ่มเติม", align: "left", type: "text", get: t => t.extraStatus || "—", title: t => t.extraStatusAt ? `ตั้งเมื่อ ${t.extraStatusAt}` : undefined },
+    ...laneCols("lane_parts", "parts"),
+    ...laneCols("lane_head",  "head"),
+    ...laneCols("lane_pork",  "pork"),
     { id: "summaryPrintedAt", grp: "docs",   label: "ใบสรุป",         align: "center", get: t => t.summaryPrintedAt },
     { id: "invoicedAt",       grp: "docs",   label: "Invoice",         align: "center", get: t => t.invoicedAt },
     { id: "exitSTD",          grp: "exit",   label: "STD ออก",         align: "center", get: t => getQ(t)?.exitTime },
@@ -5891,22 +6108,22 @@ const WorkTracking = ({ trucks, queue, detailMapByChannel = {}, masterLane = [] 
     } },
   ];
 
-  const isTimeCol = id => !["plate","customerGroup"].includes(id);
+  const TEXT_COL_IDS = COLS.filter(c => c.type === "text").map(c => c.id);
+  const isTimeCol = id => !["plate", ...TEXT_COL_IDS].includes(id);
 
   const handleSort = (id) => {
-    if (!isTimeCol(id) && id !== "plate" && id !== "customerGroup") return;
     setSortCol(c => { if (c === id) { setSortDir(d => d === 1 ? -1 : 1); return c; } setSortDir(1); return id; });
   };
 
   const sortVal = (t, colId) => {
     const col = COLS.find(c => c.id === colId);
     const v = col?.get(t);
-    if (v == null || v === "") return sortDir === 1 ? "zz" : "";
+    if (v == null || v === "" || v === "—") return sortDir === 1 ? "zz" : "";
     if (colId === "entryDelta" || colId === "exitDelta") {
       const diff = Number(v);
       return String(diff + 10000).padStart(5, "0");
     }
-    if (isTimeCol(colId) && colId !== "customerGroup") {
+    if (isTimeCol(colId)) {
       const n = workTimeValue(v);
       return String(n).padStart(5, "0");
     }
@@ -5926,32 +6143,22 @@ const WorkTracking = ({ trucks, queue, detailMapByChannel = {}, masterLane = [] 
     return `${late ? "-" : "+"}${formatMinsDelta(Math.abs(diff))}`;
   };
 
+  // สร้างจาก COLS โดยตรง (single source of truth เดียวกับตารางบนจอ) — คอลัมน์ใหม่ที่เพิ่มใน COLS
+  // ต่อไปจะโผล่ใน Export Excel ให้อัตโนมัติเสมอ ไม่ต้องมาแก้ export แยกอีกจุดแล้วลืมอัพเดตให้ตรงกัน
+  // คอลัมน์ของ 3 ลาน (parts/head/pork) ใช้ label ซ้ำกัน (แยกกันด้วยกลุ่มบนจอ) — ต้องเติมชื่อลาน
+  // นำหน้าตอน export ไม่งั้น key ใน object ชนกัน คอลัมน์ของลานหลังจะเขียนทับลานก่อนหน้า
+  const GRP_EXPORT_PREFIX = { parts: "ชิ้นส่วน", head: "หัว/เครื่องใน", pork: "หมูซีก" };
   const exportExcel = () => {
     const rows = sorted.map(t => {
-      const q = getQ(t);
-      const entryDiff = q?.entryTime && t.arrivedAt ? workTimeValue(t.arrivedAt) - workTimeValue(q.entryTime) : null;
-      const exitDiff  = q?.exitTime && t.invoicedAt ? workTimeValue(t.invoicedAt) - workTimeValue(q.exitTime) : null;
-      return {
-        "ทะเบียน":               t.plate || "",
-        "กลุ่มลูกค้า":           t.customerGroup || "",
-        "STD เข้า":              q?.entryTime || "",
-        "ACT เข้า":              t.arrivedAt || "",
-        "เข้าเร็ว/ช้า":          deltaLabel(entryDiff),
-        "พิมพ์ใบเบิก":           t.pickingAt || "",
-        "ตรวจอุณหภูมิรถ ชิ้นส่วน": t.qcLanes?.lane_parts?.doneAt || "",
-        "QC ชิ้นส่วน":            t.sampleLanes?.lane_parts?.doneAt || "",
-        "โหลด ชิ้นส่วน":          t.loadLanes?.lane_parts?.doneAt || "",
-        "ตรวจอุณหภูมิรถ หัว":     t.qcLanes?.lane_head?.doneAt || "",
-        "QC หัว/เครื่องใน":       t.sampleLanes?.lane_head?.doneAt || "",
-        "โหลด หัว/เครื่องใน":     t.loadLanes?.lane_head?.doneAt || "",
-        "ตรวจอุณหภูมิรถ หมูซีก":  t.qcLanes?.lane_pork?.doneAt || "",
-        "QC หมูซีก":              t.sampleLanes?.lane_pork?.doneAt || "",
-        "โหลด หมูซีก":            t.loadLanes?.lane_pork?.doneAt || "",
-        "ใบสรุป":                t.summaryPrintedAt || "",
-        "Invoice":               t.invoicedAt || "",
-        "STD ออก":               q?.exitTime || "",
-        "ออกเร็ว/ช้า":           deltaLabel(exitDiff),
-      };
+      const row = {};
+      for (const col of COLS) {
+        const key = GRP_EXPORT_PREFIX[col.grp] ? `${GRP_EXPORT_PREFIX[col.grp]} - ${col.label}` : col.label;
+        const v = col.get(t);
+        if (col.id === "entryDelta" || col.id === "exitDelta") row[key] = deltaLabel(v);
+        else row[key] = (v == null || v === "—") ? "" : v;
+      }
+      row["สถานะ"] = t.status || "";
+      return row;
     });
     const ws = XLSX.utils.json_to_sheet(rows);
     const wb = XLSX.utils.book_new();
@@ -6040,20 +6247,65 @@ const WorkTracking = ({ trucks, queue, detailMapByChannel = {}, masterLane = [] 
     },
   ];
 
+  const modeBtn = (m, label) => (
+    <button onClick={() => setDateMode(m)}
+      style={{ background: dateMode === m ? "#111827" : "#fff", color: dateMode === m ? "#fff" : "#111827", border: "1.5px solid #d1d5db", borderRadius: 0, padding: "6px 12px", fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}>
+      {label}
+    </button>
+  );
+
   return (
     <div>
       {/* Top bar */}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
         <h2 style={{ margin: 0, fontWeight: 900, fontSize: 20 }}>Tracking การทำงาน</h2>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-          <input type="date" value={date} onChange={e => setDate(e.target.value)}
-            style={{ border: "1.5px solid #d1d5db", borderRadius: 0, padding: "7px 11px", fontSize: 13, fontWeight: 600, outline: "none" }} />
-          <button onClick={exportExcel}
-            style={{ background: "#16a34a", color: "#fff", border: "none", borderRadius: 0, padding: "7px 16px", fontSize: 13, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>
-            Export Excel
-          </button>
+          {modeBtn("single", "รายวัน")}
+          {modeBtn("range", "ช่วงวันที่")}
+          {modeBtn("all", "ทั้งหมด")}
+          {dateMode === "single" && <>
+            <button onClick={() => setDate(today)}
+              style={{ background: date === today ? "#2563eb" : "#fff", color: date === today ? "#fff" : "#111827", border: "1.5px solid #d1d5db", borderRadius: 0, padding: "6px 12px", fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}>
+              วันนี้
+            </button>
+            <button onClick={() => setDate(addDaysToDateStr(today, -1))}
+              style={{ background: date === addDaysToDateStr(today, -1) ? "#2563eb" : "#fff", color: date === addDaysToDateStr(today, -1) ? "#fff" : "#111827", border: "1.5px solid #d1d5db", borderRadius: 0, padding: "6px 12px", fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}>
+              เมื่อวาน
+            </button>
+            <input type="date" value={date} onChange={e => setDate(e.target.value)}
+              style={{ border: "1.5px solid #d1d5db", borderRadius: 0, padding: "7px 11px", fontSize: 13, fontWeight: 600, outline: "none" }} />
+            <button onClick={exportExcel}
+              style={{ background: "#16a34a", color: "#fff", border: "none", borderRadius: 0, padding: "7px 16px", fontSize: 13, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>
+              Export Excel
+            </button>
+          </>}
+          {dateMode === "range" && <>
+            <input type="date" value={rangeStart} onChange={e => setRangeStart(e.target.value)}
+              style={{ border: "1.5px solid #d1d5db", borderRadius: 0, padding: "7px 11px", fontSize: 13, fontWeight: 600, outline: "none" }} />
+            <span style={{ color: "#9ca3af" }}>ถึง</span>
+            <input type="date" value={rangeEnd} onChange={e => setRangeEnd(e.target.value)}
+              style={{ border: "1.5px solid #d1d5db", borderRadius: 0, padding: "7px 11px", fontSize: 13, fontWeight: 600, outline: "none" }} />
+          </>}
         </div>
       </div>
+
+      {dateMode !== "single" && (
+        <DailyHealthTable rows={rangeHealth} loading={loadingRange} onViewDate={d => { setDate(d); setDateMode("single"); }} />
+      )}
+
+      {dateMode === "single" && <>
+      {archiveData?.is_reconstructed && (
+        <div style={{ background: "#fffbeb", color: "#92400e", border: "1.5px solid #fde68a", borderRadius: 0, padding: "10px 14px", fontSize: 13, fontWeight: 700, marginBottom: 12 }}>
+          🛠️ ข้อมูลวันนี้เป็นข้อมูลกู้คืนบางส่วน (ไม่ใช่ต้นฉบับ) — {archiveData.reconstructed_note || "กู้จาก R2 photo timestamp หลังข้อมูลเดิมถูกเขียนทับ ไม่มี STD/ใบเบิก/Invoice/กลุ่มลูกค้า"}
+        </div>
+      )}
+      {integrityWarning && (
+        <div style={{ background: "#fef2f2", color: "#991b1b", border: "1.5px solid #fecaca", borderRadius: 0, padding: "10px 14px", fontSize: 13, fontWeight: 700, marginBottom: 12 }}>
+          ⚠️ {integrityWarning}
+        </div>
+      )}
+
+      <DataHealthPanel date={date} today={today} activeTrucks={activeTrucks} activeQueue={activeQueue} audit={dayAudit} />
 
       {/* Summary stat cards */}
       {!loadingArchive && (
@@ -6108,7 +6360,7 @@ const WorkTracking = ({ trucks, queue, detailMapByChannel = {}, masterLane = [] 
             </thead>
             <tbody>
               {sorted.length === 0 && (
-                <tr><td colSpan={COLS.length} style={{ textAlign: "center", color: "#9ca3af", padding: 40, background: "#fff" }}>ยังไม่มีข้อมูลในวันนี้</td></tr>
+                <tr><td colSpan={COLS.length} style={{ textAlign: "center", color: "#9ca3af", padding: 40, background: "#fff" }}>{date === today ? "ยังไม่มีข้อมูลในวันนี้" : `ไม่มีข้อมูลของวันที่ ${date}`}</td></tr>
               )}
               {sorted.map((t, i) => {
                 const q = getQ(t);
@@ -6127,8 +6379,9 @@ const WorkTracking = ({ trucks, queue, detailMapByChannel = {}, masterLane = [] 
                         </td>
                       );
 
-                      if (col.id === "customerGroup") return (
-                        <td key={col.id} style={{ padding: "9px 10px", background: cellBg, borderRight: "1px solid #e5e7eb", maxWidth: 110, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      if (col.type === "text") return (
+                        <td key={col.id} title={col.title ? col.title(t) : (val && val !== "—" ? val : undefined)}
+                          style={{ padding: "9px 10px", background: cellBg, borderRight: "1px solid #e5e7eb", maxWidth: 110, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textAlign: col.align || "left" }}>
                           <span style={{ fontSize: 12, color: "#374151" }}>{val || "—"}</span>
                         </td>
                       );
@@ -6192,10 +6445,11 @@ const WorkTracking = ({ trucks, queue, detailMapByChannel = {}, masterLane = [] 
 
                       // Generic time cell
                       const g = WT_GROUP_MAP[col.grp];
+                      const cellTitle = col.title ? col.title(t) : undefined;
                       return (
-                        <td key={col.id} style={{ padding: "7px 10px", background: cellBg, borderRight: "1px solid #e5e7eb", textAlign: "center", whiteSpace: "nowrap" }}>
+                        <td key={col.id} title={cellTitle} style={{ padding: "7px 10px", background: cellBg, borderRight: "1px solid #e5e7eb", textAlign: "center", whiteSpace: "nowrap" }}>
                           {val
-                            ? <span style={{ fontWeight: 700, color: g.mid, fontSize: 13 }}>{val}</span>
+                            ? <span style={{ fontWeight: 700, color: g.mid, fontSize: 13 }}>{val}{cellTitle ? " 🛈" : ""}</span>
                             : <span style={{ color: "#e5e7eb" }}>—</span>}
                         </td>
                       );
@@ -6207,6 +6461,7 @@ const WorkTracking = ({ trucks, queue, detailMapByChannel = {}, masterLane = [] 
           </table>
         </div>
       )}
+      </>}
     </div>
   );
 };
@@ -6298,7 +6553,14 @@ const LaneSelect = ({ tabs, roleLabel, onSelect, onBack }) => (
 // MAIN APP
 // ─────────────────────────────────────────────────────────────────────────────
 const fetchQueue  = async () => { const { data } = await supabase.from("wh_queue").select("*");  return (data || []).map(r => r.data).sort((a, b) => (a.seq ?? Infinity) - (b.seq ?? Infinity)); };
-const fetchTrucks = async () => { const { data, error } = await supabase.from("wh_trucks").select("*"); if (error) throw error; return (data || []).map(r => r.data); };
+// กรอง is_deleted ออก (soft-delete, ดู supabase-add-soft-delete-trucks.sql) — ถ้ายังไม่ได้รัน
+// migration นั้น คอลัมน์นี้จะยังไม่มี ให้ fallback ไป select แบบเดิมแทนเพื่อไม่ให้แอปพังทั้งระบบ
+const fetchTrucks = async () => {
+  let res = await supabase.from("wh_trucks").select("*").eq("is_deleted", false);
+  if (res.error) res = await supabase.from("wh_trucks").select("*");
+  if (res.error) throw res.error;
+  return (res.data || []).map(r => r.data);
+};
 const fetchMaster = async () => { const { data } = await supabase.from("wh_master").select("*").eq("id", "master"); return data && data[0] ? (data[0].data || []) : []; };
 const fetchPendingQueue = async () => { const { data } = await supabase.from("wh_master").select("*").eq("id", "pending_queue"); return data && data[0] ? (data[0].data || null) : null; };
 const fetchDetailSrc = async (date = cycleDateStr()) => {
@@ -6336,6 +6598,7 @@ export default function App() {
   const [queue,      setQueue]      = useState([]);
   const [trucks,     setTrucks]     = useState([]);
   const [pendingQueue, setPendingQueue] = useState(null); // คิวรถที่ LG อัพโหลดล่วงหน้า รอถูกดึงมาใช้เป็นคิวปัจจุบัน
+  const [dataWarning, setDataWarning] = useState(null); // แจ้งเตือนจาก close_work_day_tx เมื่อพบข้อมูลลดลงผิดปกติตอนปิดวันทำงาน
   const [masterLane, setMasterLane] = useState(() => {
     try { return JSON.parse(localStorage.getItem("wh_master_cache") || "[]"); } catch { return []; }
   });
@@ -6401,27 +6664,22 @@ export default function App() {
         // อาจเลยวันที่ตั้งใจไว้ไปแล้วหลายวัน คำนวณจาก forDate จึงได้วันที่ถูกต้องเสมอ
         const archiveDate = addDaysToDateStr(pending.forDate, -1);
 
-        const [{ data: curQueueRows, error: qErr }, { data: curTruckRows, error: tErr }] = await Promise.all([
-          supabase.from("wh_queue").select("*"),
-          supabase.from("wh_trucks").select("*"),
-        ]);
-        // ถ้าอ่านข้อมูลปัจจุบันไม่สำเร็จ ห้ามลบต่อ ไม่งั้นจะเก็บ archive เป็นค่าว่างแล้วลบของจริงทิ้งจริง —
-        // ปล่อยผ่านรอบนี้ไป รอบถัดไป (60 วิ) จะลองใหม่ เพราะยังไม่ได้แตะข้อมูลอะไรเลย
-        if (qErr || tErr) { console.error("promoteIfDue: อ่านคิว/รถปัจจุบันไม่สำเร็จ, ข้ามรอบนี้", qErr || tErr); return; }
-
-        const { error: archErr } = await supabase.from("wh_archive").upsert({
-          archive_date: archiveDate,
-          queue:  (curQueueRows  || []).map(r => r.data),
-          trucks: (curTruckRows || []).map(r => r.data),
+        // ปิดวันทำงานผ่าน RPC เดียว (close_work_day_tx, ดู supabase-fix-archive-race-condition.sql) —
+        // ทำ archive+wipe+ใส่คิวใหม่ทั้งหมดในทรานแซกชันเดียวฝั่ง DB พร้อม advisory lock กันชนกับ
+        // close_work_day() (cron) หรือ promoteIfDue() ของแท็บ/เครื่องอื่นที่เปิดค้างไว้พร้อมกัน —
+        // เดิมโค้ดนี้ทำ read (client) แล้วค่อย upsert/delete/insert แยก 4 ก้าว ซึ่งมีช่วงเวลาที่อีก
+        // แท็บหนึ่งมาแทรกกลางได้ ทำให้ archive ของวันที่ปิดไปแล้วถูกเขียนทับด้วยคิววันใหม่ที่เพิ่ง
+        // promote เข้าไป (สาเหตุที่ข้อมูลวันที่ 6-8 ก.ย. หายไปจริง)
+        const { data: result, error: rpcErr } = await supabase.rpc("close_work_day_tx", {
+          p_archive_date: archiveDate,
+          p_new_queue: pending.rows,
+          p_source: "client_promote",
         });
-        // เก็บ archive ไม่สำเร็จ ก็ห้ามลบข้อมูลจริงทิ้งเช่นกัน — ไม่งั้นข้อมูลของวันที่ปิดจะหายถาวร
-        if (archErr) { console.error("promoteIfDue: บันทึก archive ไม่สำเร็จ, ข้ามรอบนี้", archErr); return; }
+        // RPC ยังไม่มี (ยังไม่ได้รัน SQL migration) หรือ error อื่น — ห้ามลบข้อมูลจริงทิ้งโดยไม่มี RPC
+        // คุ้มครอง ปล่อยผ่านรอบนี้ไป รอบถัดไป (60 วิ) จะลองใหม่ เพราะยังไม่ได้แตะข้อมูลอะไรเลย
+        if (rpcErr) { console.error("promoteIfDue: close_work_day_tx ไม่สำเร็จ, ข้ามรอบนี้", rpcErr); return; }
+        if (result?.warning) setDataWarning(result.warning);
 
-        await supabase.from("wh_trucks").delete().neq("id", "");
-        await supabase.from("wh_queue").delete().neq("id", "");
-        if (pending.rows.length > 0) {
-          await supabase.from("wh_queue").upsert(pending.rows.map(q => ({ id: q.id, data: q })));
-        }
         await supabase.from("wh_master").delete().eq("id", "pending_queue");
 
         fetchQueue().then(setQueue);
@@ -6523,16 +6781,31 @@ export default function App() {
   };
 
   const handleDeleteTruck = async (id) => {
-    await supabase.from("wh_trucks").delete().eq("id", id);
+    // soft delete (ดู supabase-add-soft-delete-trucks.sql) — ไม่ DELETE จริง กันข้อมูลรถหายถาวร
+    // ถ้ากดผิด/merge พลาด ยังกู้คืนได้ก่อนวันทำงานนั้นจะปิด (close_work_day_tx ไม่นับแถวนี้เข้า archive)
+    const { error } = await supabase.from("wh_trucks")
+      .update({ is_deleted: true, deleted_at: new Date().toISOString(), deleted_by: role || "unknown" })
+      .eq("id", id);
+    if (error) {
+      window.alert("ลบไม่สำเร็จ — อาจยังไม่ได้รัน supabase-add-soft-delete-trucks.sql: " + error.message);
+      throw error;
+    }
+    setTrucks(prev => prev.filter(t => t.id !== id));
   };
 
   const handleReset = async () => {
     if (!window.confirm("ล้างข้อมูลทั้งหมดสำหรับวันใหม่?")) return;
     // archive date = วันรอบงานที่เพิ่งปิด (same work-day cutoff as cycleDateStr, kept in sync via that helper)
     const archiveDate = cycleDateStr();
-    await supabase.from("wh_archive").upsert({ archive_date: archiveDate, queue, trucks });
-    await supabase.from("wh_queue").delete().neq("id", "");
-    await supabase.from("wh_trucks").delete().neq("id", "");
+    // ผ่าน RPC เดียวกับ promoteIfDue/cron (close_work_day_tx) แทนการ upsert+delete ตรงๆ —
+    // กันไม่ให้กดปุ่มนี้ชนกับ cron หรือ promoteIfDue ที่อาจกำลังปิดวันเดียวกันอยู่พอดี
+    const { data: result, error } = await supabase.rpc("close_work_day_tx", {
+      p_archive_date: archiveDate,
+      p_new_queue: null,
+      p_source: "manual_reset",
+    });
+    if (error) { window.alert("ล้างวันใหม่ไม่สำเร็จ: " + error.message); return; }
+    if (result?.warning) setDataWarning(result.warning);
   };
 
   const handleSetQueue = async (newQueue) => {
@@ -6824,6 +7097,12 @@ export default function App() {
         </div>
         {!isNarrow && <div style={{ color: "#f9fafb", fontSize: 15, fontWeight: 700, fontVariantNumeric: "tabular-nums", flexShrink: 0 }}>{TODAY} {headerClock}</div>}
       </div>
+      {dataWarning && (
+        <div style={{ background: "#fef3c7", color: "#92400e", padding: "10px 16px", fontSize: 13, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, borderBottom: "1.5px solid #f59e0b" }}>
+          <span>⚠️ {dataWarning} — ดูรายละเอียดใน "Log ภาพรวมการทำงาน" (wh_archive_audit)</span>
+          <button onClick={() => setDataWarning(null)} style={{ background: "transparent", border: "none", color: "#92400e", fontWeight: 900, fontSize: 15, cursor: "pointer", flexShrink: 0 }}>✕</button>
+        </div>
+      )}
       <div style={{ maxWidth: tab === "dashboard" || tab === "dashboard_transport" || tab === "work_tracking" ? "none" : tab === "picking" ? 1400 : 960, margin: "0 auto", padding: tab === "dashboard" || tab === "dashboard_transport" ? (isMobile ? "8px 10px 80px" : "8px 14px 14px") : (isMobile ? "16px 12px 80px" : "20px 14px 100px") }}>
         {tab === "dashboard" && <Dashboard trucks={trucks} queue={queue} onReset={handleReset} lane={dashLane === "main" ? null : dashLane} detailMap={detailMapByChannel} myPlate={myPlate} />}
         {tab === "dashboard_transport" && <Dashboard trucks={trucks} queue={queue} onReset={handleReset} lane={null} detailMap={detailMapByChannel} title="Dashboard ขนส่ง" myPlate={myPlate} simple />}
