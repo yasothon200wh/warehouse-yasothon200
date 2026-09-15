@@ -1643,7 +1643,7 @@ const LGUpload = ({ queue, onSetQueue, pendingQueue, onSetPendingQueue, onClearP
     setQueueSaving(true);
     try {
       const exitTime = addMinutesToHHMM(editData.loadDoneTime, settings.docTimeMinutes);
-      await onSetQueue(queue.map(q => q.id === editId ? { ...q, ...editData, zone: editData.zone, time: editData.entryTime, exitTime } : q));
+      await onSetQueue(queue.map(q => q.id === editId ? { ...q, ...editData, zone: editData.zone, time: editData.entryTime, exitTime } : q), "lg_edit_row");
       setEditId(null); setEditData({});
     } catch (e) {
       alert("บันทึกไม่สำเร็จ: " + e.message);
@@ -1655,7 +1655,7 @@ const LGUpload = ({ queue, onSetQueue, pendingQueue, onSetPendingQueue, onClearP
     if (!window.confirm("ลบรถคันนี้ออกจากคิว?")) return;
     setQueueSaving(true);
     try {
-      await onSetQueue(queue.filter(q => q.id !== id));
+      await onSetQueue(queue.filter(q => q.id !== id), "lg_delete_row");
     } catch (e) {
       alert("ลบไม่สำเร็จ: " + e.message);
     } finally {
@@ -1667,7 +1667,7 @@ const LGUpload = ({ queue, onSetQueue, pendingQueue, onSetPendingQueue, onClearP
     setQueueSaving(true);
     try {
       const exitTime = addMinutesToHHMM(manualData.loadDoneTime, settings.docTimeMinutes);
-      await onSetQueue([...queue, { id: `M${Date.now()}`, ...manualData, exitTime, date: manualData.date || SHORT_DATE(), time: manualData.entryTime, driver: "", zone: manualData.zone || "", product: "", destination: "", qty: 0, unit: "กก.", loadTime: "" }]);
+      await onSetQueue([...queue, { id: `M${Date.now()}`, ...manualData, exitTime, date: manualData.date || SHORT_DATE(), time: manualData.entryTime, driver: "", zone: manualData.zone || "", product: "", destination: "", qty: 0, unit: "กก.", loadTime: "" }], "lg_manual_add");
       setManualData({ date: "", plate: "", customerGroup: "", zone: "", entryTime: "", loadDoneTime: "" });
       setAddingManual(false);
     } catch (e) {
@@ -1748,7 +1748,7 @@ const LGUpload = ({ queue, onSetQueue, pendingQueue, onSetPendingQueue, onClearP
       if (mode === "advance") {
         await onSetPendingQueue(newQueue, fileName);
       } else {
-        await onSetQueue(newQueue);
+        await onSetQueue(newQueue, "lg_upload_excel");
       }
       setSavedCount(newQueue.length);
       setStatus("done");
@@ -6808,12 +6808,26 @@ export default function App() {
     if (result?.warning) setDataWarning(result.warning);
   };
 
-  const handleSetQueue = async (newQueue) => {
-    const { error: delErr } = await supabase.from("wh_queue").delete().neq("id", "");
-    if (delErr) throw new Error(delErr.message);
-    if (newQueue.length > 0) {
-      const { error: upErr } = await supabase.from("wh_queue").upsert(newQueue.map(q => ({ id: q.id, data: q })));
-      if (upErr) throw new Error(upErr.message);
+  const handleSetQueue = async (newQueue, source = "lg_edit") => {
+    // ผ่าน RPC เดียว (set_queue_tx, ดู supabase-fix-queue-overwrite-race.sql) แทนการ
+    // delete()+upsert() แยก 2 คำสั่งจาก client เดิม — ทำใน transaction เดียวฝั่ง DB (ถ้า insert
+    // fail จะ rollback การ delete ให้อัตโนมัติ) และมี guard ปฏิเสธการเขียนทับที่ดูผิดปกติ
+    // (คิวหายไปเกินครึ่ง/หายหมด) ป้องกันเคสไฟล์ผิด/เน็ตหลุดระหว่างอัพโหลดทำให้คิวทั้งวันหายถาวร
+    // (สาเหตุที่คาดว่าทำให้ข้อมูลวันที่ 11 ก.ย. หายไปจริง)
+    const callSetQueue = (force) => supabase.rpc("set_queue_tx", {
+      p_new_queue: newQueue,
+      p_source: source,
+      p_force: force,
+    });
+    let { data: result, error } = await callSetQueue(false);
+    if (error) throw new Error(error.message);
+    if (result?.blocked) {
+      const confirmed = window.confirm(
+        `${result.reason}\n\nถ้าตั้งใจบันทึกข้อมูลนี้จริง กด ตกลง เพื่อยืนยันอีกครั้ง (ถ้าไม่แน่ใจ กด ยกเลิก แล้วตรวจไฟล์/ข้อมูลก่อน)`
+      );
+      if (!confirmed) throw new Error("ยกเลิกการบันทึก — ระบบตรวจพบว่าข้อมูลคิวอาจไม่ครบ");
+      ({ data: result, error } = await callSetQueue(true));
+      if (error) throw new Error(error.message);
     }
     setQueue(newQueue);
     // merge walk-in trucks กับ queue entries แบบ one-to-one เรียงตาม seq
